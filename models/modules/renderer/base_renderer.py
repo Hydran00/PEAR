@@ -31,7 +31,8 @@ class BaseMeshRenderer(nn.Module):
         self.bg_color = bg_color
         self.focal_length = focal_length
 
-        self.raster_settings = RasterizationSettings(image_size=image_size, blur_radius=0.0, faces_per_pixel=1)
+        # Use naive rasterization (bin_size=0) to avoid coarse-rasterization overflow
+        self.raster_settings = RasterizationSettings(image_size=image_size, blur_radius=0.0, faces_per_pixel=1, bin_size=0)
         self.lights = PointLights(device=device, location=[[0.0, 0.0, 3.0]])
         self.manual_lights = PointLights(
             device=self.device,
@@ -41,6 +42,12 @@ class BaseMeshRenderer(nn.Module):
             specular_color=((0.01, 0.01, 0.01), )
         )
         self.blend = BlendParams(background_color=np.array(bg_color)/225.)
+        # cache shader to avoid re-creating it every frame (expensive)
+        try:
+            self._cached_shader = SoftPhongShader(device=self.device, cameras=None, lights=self.lights, blend_params=self.blend)
+        except Exception:
+            # fallback if SoftPhongShader requires cameras on init
+            self._cached_shader = None
 
     def _build_cameras(self, transform_matrix, focal_length):
         batch_size = transform_matrix.shape[0]
@@ -85,9 +92,11 @@ class BaseMeshRenderer(nn.Module):
                 faces=t_faces.to(self.device),
                 textures=textures
             )
+            # reuse cached shader if available to reduce per-frame overhead
+            shader = self._cached_shader if getattr(self, '_cached_shader', None) is not None else SoftPhongShader(cameras=cameras, lights=self.lights, device=self.device, blend_params=self.blend)
             renderer = MeshRenderer(
                 rasterizer=MeshRasterizer(cameras=cameras, raster_settings=self.raster_settings),
-                shader=SoftPhongShader(cameras=cameras, lights=self.lights, device=self.device, blend_params=self.blend)
+                shader=shader
             )
             render_results = renderer(mesh).permute(0, 3, 1, 2)
             images = render_results[:, :3]
@@ -291,12 +300,14 @@ class TextureRenderer(nn.Module):
         meshes_world = Meshes(verts=vertices_world, faces=faces, textures=textures_uv)
         # phong renderer
         raster_settings = RasterizationSettings(
-            image_size=image_size, blur_radius=0.0, faces_per_pixel=1, 
-            perspective_correct=True, cull_backfaces=True
+            image_size=image_size, blur_radius=0.0, faces_per_pixel=1,
+            perspective_correct=True, cull_backfaces=True, bin_size=0
         )
+        # reuse cached shader if available
+        shader2 = self._cached_shader if getattr(self, '_cached_shader', None) is not None else SoftPhongShader(device=self.device, cameras=cameras, lights=self.lights)
         phong_renderer = MeshRenderer(
             rasterizer=MeshRasterizer(cameras=cameras, raster_settings=raster_settings),
-            shader=SoftPhongShader(device=self.device, cameras=cameras, lights=self.lights)
+            shader=shader2
         )
         image_ref = phong_renderer(meshes_world=meshes_world)
         images = image_ref[..., :3].permute(0, 3, 1, 2)

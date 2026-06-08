@@ -299,10 +299,8 @@ class GS_MeshRasterizer(MeshRasterizer):
         """
         super().__init__()
         if raster_settings is None:
-            raster_settings = RasterizationSettings()
-
-        self.cameras = cameras
-        self.raster_settings = raster_settings
+            # default to naive rasterization to avoid coarse-rasterization overflow
+            raster_settings = RasterizationSettings(bin_size=0)
 
     def to(self, device):
         # Manually move to device cameras as it is not a subclass of nn.Module
@@ -401,7 +399,8 @@ class GS_BaseMeshRenderer(torch.nn.Module):
         self.bg_color = bg_color
         self.focal_length = focal_length
 
-        self.raster_settings = RasterizationSettings(image_size=image_size, blur_radius=0.0, faces_per_pixel=1)
+        # default to naive rasterization to avoid coarse-rasterization overflow
+        self.raster_settings = RasterizationSettings(image_size=image_size, blur_radius=0.0, faces_per_pixel=1, bin_size=0)
         if inverse_light:
             self.lights = PointLights( location=[[0.0, -1.0, -10.0]])
         else:

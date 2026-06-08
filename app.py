@@ -90,6 +90,7 @@ except ImportError:
     def space(func):
         return func
 import imageio
+from tqdm import tqdm
 
 from einops import rearrange
 
@@ -120,7 +121,10 @@ logger = logging.getLogger(__name__)
 # Device & runtime configuration (CPU / GPU agnostic)
 # -------------------------------------------------------------------------
 TORCH_DEVICE =  torch.device("cuda" if torch.cuda.is_available() else "cpu")
+RENDER_SIZE = int(os.environ.get("PEAR_RENDER_SIZE", "512"))
 ORT_PROVIDERS = ["CUDAExecutionProvider", "CPUExecutionProvider"]
+if TORCH_DEVICE.type == 'cuda':
+    torch.backends.cudnn.benchmark = True
 
 
 
@@ -130,7 +134,7 @@ meta_cfg = ConfigDict(
 meta_cfg = add_extra_cfgs(meta_cfg)
 
 # Renderer / model init (on selected device)
-body_renderer = BodyRenderer("assets/SMPLX", 1024, focal_length=24.0)
+body_renderer = BodyRenderer("assets/SMPLX", RENDER_SIZE, focal_length=24.0)
 
 
 repo_id = "BestWJH/PEAR_models"  
@@ -160,7 +164,7 @@ thread_pool_executor = ThreadPoolExecutor(max_workers=2)
 
 def build_cameras_kwargs(batch_size, focal_length):
     screen_size = (
-        torch.tensor([1024, 1024], device=TORCH_DEVICE)
+        torch.tensor([RENDER_SIZE, RENDER_SIZE], device=TORCH_DEVICE)
         .float()[None]
         .repeat(batch_size, 1)
     )
@@ -252,7 +256,7 @@ def numpy_to_base64(arr):
 
 def polynomial_smooth(sequence, window_size=5, polyorder=2):
 
-    seq = np.asarray(sequence.cpu())
+    seq = sequence.detach().float().cpu().numpy()
     if seq.ndim < 2:
         raise ValueError(f"输入必须至少是 2 维，当前 shape={seq.shape}")
 
@@ -263,7 +267,79 @@ def polynomial_smooth(sequence, window_size=5, polyorder=2):
 
     # Savitzky–Golay 沿着 axis=0 (时间维) 平滑
     smoothed = savgol_filter(seq, window_length=window_size, polyorder=polyorder, axis=0, mode='interp')
-    return smoothed
+    return smoothed.astype(np.float32, copy=False)
+
+
+def smoothed_tensor(sequence, window_size=5, polyorder=2):
+    return torch.as_tensor(
+        polynomial_smooth(sequence, window_size=window_size, polyorder=polyorder),
+        dtype=torch.float32,
+        device=TORCH_DEVICE,
+    )
+
+
+class Open3DOffscreenMeshRenderer:
+    def __init__(self, faces, image_size=512):
+        import open3d as o3d
+
+        self.o3d = o3d
+        self.image_size = int(image_size)
+        self.faces = np.asarray(faces, dtype=np.int32)
+        self.renderer = o3d.visualization.rendering.OffscreenRenderer(
+            self.image_size,
+            self.image_size,
+        )
+        self.renderer.scene.set_background([1.0, 1.0, 1.0, 1.0])
+        self.material = o3d.visualization.rendering.MaterialRecord()
+        self.material.shader = "defaultLit"
+        self.material.base_color = [0.86, 0.70, 0.58, 1.0]
+
+    def render(self, vertices):
+        vertices = np.asarray(vertices, dtype=np.float64)
+        mesh = self.o3d.geometry.TriangleMesh(
+            self.o3d.utility.Vector3dVector(vertices),
+            self.o3d.utility.Vector3iVector(self.faces),
+        )
+        mesh.compute_vertex_normals()
+
+        self.renderer.scene.clear_geometry()
+        self.renderer.scene.add_geometry("body", mesh, self.material)
+
+        bbox = mesh.get_axis_aligned_bounding_box()
+        center = bbox.get_center().astype(np.float32)
+        extent = float(np.max(bbox.get_extent()))
+        distance = max(extent * 2.4, 1.0)
+        eye = center + np.array([0.0, 0.0, distance], dtype=np.float32)
+        up = np.array([0.0, 1.0, 0.0], dtype=np.float32)
+        self.renderer.setup_camera(35.0, center, eye, up)
+
+        image = np.asarray(self.renderer.render_to_image())
+        if image.ndim == 3 and image.shape[-1] > 3:
+            image = image[..., :3]
+        return image.astype(np.uint8, copy=False)
+
+
+def build_demo_renderer(faces):
+    backend = os.environ.get("PEAR_RENDER_BACKEND", "pytorch3d").lower()
+    if backend != "open3d":
+        print(f"🎨 Using PyTorch3D renderer at {RENDER_SIZE}x{RENDER_SIZE}.")
+        return None
+
+    has_display = bool(os.environ.get("DISPLAY") or os.environ.get("WAYLAND_DISPLAY"))
+    force_open3d = os.environ.get("PEAR_FORCE_OPEN3D", "0") == "1"
+    if not has_display and not force_open3d:
+        print("⚠️ Open3D offscreen skipped: no DISPLAY/WAYLAND_DISPLAY. Set PEAR_FORCE_OPEN3D=1 to try anyway.")
+        print(f"🎨 Using PyTorch3D renderer at {RENDER_SIZE}x{RENDER_SIZE}.")
+        return None
+
+    try:
+        image_size = int(os.environ.get("PEAR_OPEN3D_RENDER_SIZE", "512"))
+        renderer = Open3DOffscreenMeshRenderer(faces, image_size=image_size)
+        print(f"🎨 Using Open3D offscreen renderer at {image_size}x{image_size}.")
+        return renderer
+    except Exception as e:
+        print(f"⚠️ Open3D renderer unavailable ({e}); falling back to PyTorch3D.")
+        return None
 
 
 def handle_video_upload(video):
@@ -348,6 +424,9 @@ def mesh_inference(temp_dir, video_name):
     body_renderer = body_renderer.to(TORCH_DEVICE)
     ehm_model = ehm_model.to(TORCH_DEVICE)
     ehm = ehm.to(TORCH_DEVICE)
+    body_renderer.eval()
+    ehm_model.eval()
+    ehm.eval()
     lights = get_lights(TORCH_DEVICE)
 
     # ... 后续推理逻辑 ...
@@ -375,14 +454,23 @@ def mesh_inference(temp_dir, video_name):
     flame_sequence = []
     cam_sequence = []
     # Process each frame with EHM
-    for i in range(len(video_reader)):
+    frame_pbar = tqdm(range(len(video_reader)), desc="EHM frames", unit="frame")
+    for i in frame_pbar:
         frame = video_reader[i].asnumpy()
         # TODO: Apply EHM processing to frame
         resized = pad_and_resize(frame, target_size=256)
-        img_patch = to_tensor(resized,  TORCH_DEVICE)  # (B, C, H, W)
-        img_patch =  torch.permute(img_patch/255,(2,0,1)).unsqueeze(0)
+        # convert to float tensor on device and normalize
+        img_np = resized.astype(np.float32) / 255.0
+        img_t = to_tensor(img_np, TORCH_DEVICE)  # H,W,C on device
+        img_patch = img_t.permute(2, 0, 1).unsqueeze(0)  # 1,C,H,W
 
-        outputs =  ehm_model(img_patch)  # 转移到 cuda 了
+        # run model with autocast for faster fp16 inference on CUDA
+        if TORCH_DEVICE.type == 'cuda':
+            with torch.amp.autocast('cuda'):
+                outputs = ehm_model(img_patch)
+        else:
+            outputs = ehm_model(img_patch)
+        frame_pbar.set_postfix(frame=i + 1)
 
 
         body_sequence.append(outputs['body_param'])
@@ -399,7 +487,7 @@ def mesh_inference(temp_dir, video_name):
     for key in fields1:
         data_list = [seq[key] for seq in body_sequence]
         data_tensor = torch.cat(data_list, dim=0)
-        processed1[key] = torch.tensor(polynomial_smooth(data_tensor, window_size=7, polyorder=2)).cuda()
+        processed1[key] = smoothed_tensor(data_tensor, window_size=7, polyorder=2)
 
     global_pose = processed1["global_pose"]
     body_pose = processed1["body_pose"]
@@ -420,7 +508,7 @@ def mesh_inference(temp_dir, video_name):
     for key in fields2:
         data_list = [seq[key] for seq in flame_sequence]  # 这里我猜你原意是从 eye_pose_params 取
         data_tensor = torch.cat(data_list, dim=0)
-        processed2[key] = torch.tensor(polynomial_smooth(data_tensor, window_size=5, polyorder=2)).cuda()
+        processed2[key] = smoothed_tensor(data_tensor, window_size=5, polyorder=2)
 
     eye_pose_params = processed2["eye_pose_params"]
     pose_params = processed2["pose_params"]
@@ -431,12 +519,14 @@ def mesh_inference(temp_dir, video_name):
 
 
     cam_sequence = torch.cat(cam_sequence, dim=0)
-    cam_sequence = torch.tensor(polynomial_smooth(cam_sequence, window_size=7, polyorder=2)).cuda()
+    cam_sequence = smoothed_tensor(cam_sequence, window_size=7, polyorder=2)
 
 
 
-
-    for idx in range(global_pose.shape[0]):
+    faces = body_renderer.faces[0].detach().cpu().numpy()
+    open3d_renderer = build_demo_renderer(faces)
+    render_pbar = tqdm(range(global_pose.shape[0]), desc="Rendering mesh", unit="frame")
+    for idx in render_pbar:
         
         pd_cam = cam_sequence[idx:idx+1]
 
@@ -463,13 +553,21 @@ def mesh_inference(temp_dir, video_name):
         }
 
         pd_smplx_dict = ehm(body_dict, flame_dict, pose_type='aa')
-        pd_camera = GS_Camera(**build_cameras_kwargs(1,24), R = pd_cam[0:1,:3,:3], T = pd_cam[0:1,:3,3])
-        pd_mesh_img = body_renderer.render_mesh(pd_smplx_dict['vertices'][None, 0,...], pd_camera, lights=lights,) 
-        pd_mesh_img = (pd_mesh_img[:,:3].detach().cpu().numpy()).clip(0, 255).astype(np.uint8)[0].transpose(1,2,0)
-        # pd_mesh_img = cv2.cvtColor(pd_mesh_img.copy(), cv2.COLOR_RGB2BGR)
-        all_meshes_img.append(pd_mesh_img)
+        vertices_np = pd_smplx_dict['vertices'][0].detach().float().cpu().numpy()
+        vertices_list.append(vertices_np)
 
-        # vertices_list.append(pd_smplx_dict['vertices'][0, :-120].detach().cpu().numpy())
+        if open3d_renderer is not None:
+            pd_mesh_img = open3d_renderer.render(vertices_np)
+        else:
+            pd_camera = GS_Camera(**build_cameras_kwargs(1,24), R = pd_cam[0:1,:3,:3], T = pd_cam[0:1,:3,3])
+            pd_mesh_img = body_renderer.render_mesh(pd_smplx_dict['vertices'][None, 0,...], pd_camera, lights=lights,)
+            pd_mesh_img = (pd_mesh_img[:,:3].detach().cpu().numpy()).clip(0, 255).astype(np.uint8)[0].transpose(1,2,0)
+            # pd_mesh_img = cv2.cvtColor(pd_mesh_img.copy(), cv2.COLOR_RGB2BGR)
+        all_meshes_img.append(pd_mesh_img)
+        render_pbar.set_postfix(
+            backend="open3d" if open3d_renderer is not None else "pytorch3d",
+            frame=idx + 1,
+        )
 
 
 
@@ -502,7 +600,6 @@ def mesh_inference(temp_dir, video_name):
 
     # Save a portable npz (avoid storing Trimesh objects which will fail).
     # vertices: (T, V, 3), faces: (F, 3)
-    faces = body_renderer.faces[0].detach().cpu().numpy()
     vertices = np.stack(vertices_list, axis=0) if len(vertices_list) > 0 else np.empty((0, 0, 3), dtype=np.float32)
     np.savez_compressed(os.path.join(out_dir, "results.npz"), vertices=vertices, faces=faces)
 

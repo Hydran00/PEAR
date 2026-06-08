@@ -39,11 +39,13 @@ class Renderer(BaseMeshRenderer):
 
         self.setup()
     def setup(self):
+        # Use naive rasterization (bin_size=0) to avoid coarse-rasterization overflow
         raster_settings = RasterizationSettings(
             image_size=self.image_size,
             faces_per_pixel=1,
             cull_backfaces=True,
-            perspective_correct=True
+            perspective_correct=True,
+            bin_size=0,
         )
 
         self.lights = PointLights(

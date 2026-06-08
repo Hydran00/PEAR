@@ -402,7 +402,8 @@ class GS_MeshRasterizer(MeshRasterizer):
         """
         super().__init__()
         if raster_settings is None:
-            raster_settings = RasterizationSettings()
+            # default to naive rasterization to avoid coarse-rasterization overflow
+            raster_settings = RasterizationSettings(bin_size=0)
 
         self.cameras = cameras
         self.raster_settings = raster_settings
@@ -509,11 +510,11 @@ class BaseMeshRenderer(L.LightningModule):
         self.skin_color = np.array(skin_color)
         self.bg_color = bg_color
         self.focal_length = focal_length
-        bin_size=None
-        # if image_size==296:
-        #     bin_size=20
+        # use naive rasterization to avoid coarse-rasterization overflow in some PyTorch3D builds
+        # set bin_size=0 to force naive rasterization; this avoids "Bin size was too small" warnings
+        bin_size = 0
         self.raster_settings = RasterizationSettings(image_size=image_size, blur_radius=0.0, faces_per_pixel=1,
-                                                    bin_size=bin_size)#bin_size=0  max_faces_per_bin=20_000_0
+                                bin_size=bin_size)
         if inverse_light:
             self.lights = PointLights( location=[[0.0, -1.0, -10.0]])
         else:
@@ -709,7 +710,8 @@ class GS_BaseMeshRenderer(torch.nn.Module):
         self.bg_color = bg_color
         self.focal_length = focal_length
 
-        self.raster_settings = RasterizationSettings(image_size=image_size, blur_radius=0.0, faces_per_pixel=1)
+        # default to naive rasterization to avoid coarse-rasterization overflow
+        self.raster_settings = RasterizationSettings(image_size=image_size, blur_radius=0.0, faces_per_pixel=1, bin_size=0)
         if inverse_light:
             self.lights = PointLights( location=[[0.0, -1.0, -10.0]])
         else:

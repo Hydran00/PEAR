@@ -1,6 +1,7 @@
-torch==2.0.1+cu118
-torchvision
-torchaudio
+
+torch==2.5.1
+torchvision==0.20.1
+torchaudio==2.5.1
 
 # 其他 PyTorch 扩展库
 torchgeometry
