@@ -132,6 +132,10 @@ Then run:
 python train_ehms.py -c train -d 0,1,2,3,4,5,6,7  # Adjust according to your available GPUs
 ```
 
+## Test on 3DPW-OC
+```
+python inference_3dpw.py   --dataset ../3DPW-OC/data/datasets/3dpw_test_oc.npz 
+```
 
 ## 🤗 Citation
 If you find this repository useful for your research, please use the following BibTeX entry for citation.
