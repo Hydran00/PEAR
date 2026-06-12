@@ -136,6 +136,10 @@ python train_ehms.py -c train -d 0,1,2,3,4,5,6,7  # Adjust according to your ava
 ```
 python inference_3dpw.py   --dataset ../3DPW-OC/data/datasets/3dpw_test_oc.npz 
 ```
+## Test on our Visuotactile Dataset
+```
+python3 inference_visuotactile_dataset.py   --input_path <path to folder with sequences>   --output_path <path to output folder>  --camera-index -1 # or 0,1 to get a specific camera result
+```
 
 ## 🤗 Citation
 If you find this repository useful for your research, please use the following BibTeX entry for citation.

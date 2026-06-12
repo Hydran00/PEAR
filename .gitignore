@@ -8,3 +8,4 @@ model_zoo/yolov8x.pt
 utils/__pycache__/*
 __pycache__/
 *.pyc
+outputs/
