@@ -6,6 +6,7 @@ import sys
 from pathlib import Path
 
 import cv2
+import joblib
 import numpy as np
 import torch
 import lightning
@@ -18,7 +19,7 @@ from models.modules.ehm import EHM_v2
 from models.pipeline.ehm_pipeline import Ehm_Pipeline
 from utils.pipeline_utils import to_tensor
 from utils.graphics_utils import GS_Camera
-from utils.general_utils import ConfigDict, device_parser, add_extra_cfgs
+from utils.general_utils import ConfigDict, add_extra_cfgs
 from utils.get_video import images_to_video
 from utils import rotation_converter as converter
 
@@ -37,11 +38,14 @@ myfusion_gender_from_name = None
 prepared_files = None
 make_visuotactile_metrics_row = None
 write_visuotactile_metrics_csv = None
+compute_visuotactile_surface_metrics = None
+SMPLX_TO_SMPL_MATRIX = None
 
 
 def setup_myfusion(myfusion_path):
     global VisuotactileDatasetSource, myfusion_gender_from_name, prepared_files
     global make_visuotactile_metrics_row, write_visuotactile_metrics_csv
+    global compute_visuotactile_surface_metrics
     path = Path(myfusion_path).expanduser().resolve()
     if not path.exists():
         raise FileNotFoundError(f"MyFusion path does not exist: {path}")
@@ -55,11 +59,18 @@ def setup_myfusion(myfusion_path):
         prepared_files as _prepared_files,
         write_visuotactile_metrics_csv as _write_visuotactile_metrics_csv,
     )
+    try:
+        from MyFusion.data_source.source_visuotactile_dataset import (
+            compute_visuotactile_surface_metrics as _compute_visuotactile_surface_metrics,
+        )
+    except ImportError:
+        _compute_visuotactile_surface_metrics = None
     VisuotactileDatasetSource = _VisuotactileDatasetSource
     myfusion_gender_from_name = _gender_from_name
     prepared_files = _prepared_files
     make_visuotactile_metrics_row = _make_visuotactile_metrics_row
     write_visuotactile_metrics_csv = _write_visuotactile_metrics_csv
+    compute_visuotactile_surface_metrics = _compute_visuotactile_surface_metrics
     return import_root
 
 
@@ -89,6 +100,51 @@ def sequence_paths(input_path):
     return prepared_files(str(input_path))
 
 
+def find_preferred_gt_smpl_path(input_path, sequence_dir):
+    input_root = Path(input_path)
+    sequence_dir = Path(sequence_dir)
+    raw_stem = sequence_dir.name if sequence_dir.is_dir() else sequence_dir.stem
+    stem = raw_stem[:-len("_prepared")] if raw_stem.endswith("_prepared") else raw_stem
+    names = [f"{stem}.npz", f"{stem}_gt_smpl_stride100.npz"]
+    if raw_stem != stem:
+        names.extend([f"{raw_stem}.npz", f"{raw_stem}_gt_smpl_stride100.npz"])
+
+    gt_dirs = []
+    for gt_dir in (input_root / "gt_smpl", sequence_dir / "gt_smpl"):
+        if gt_dir not in gt_dirs:
+            gt_dirs.append(gt_dir)
+
+    if sequence_dir.is_dir():
+        direct = sequence_dir / "gt_smpl.npz"
+        if direct.exists():
+            return direct
+
+    for gt_dir in gt_dirs:
+        for name in names:
+            candidate = gt_dir / name
+            if candidate.exists():
+                return candidate
+
+    for gt_dir in gt_dirs:
+        if not gt_dir.is_dir():
+            continue
+        matches = sorted(gt_dir.glob(f"{stem}*_gt_smpl*.npz"))
+        if matches:
+            return matches[0]
+    return None
+
+
+def prefer_input_gt_smpl(source, input_path, sequence_dir):
+    preferred_path = find_preferred_gt_smpl_path(input_path, sequence_dir)
+    if preferred_path is None:
+        return
+    current_path = getattr(source, "gt_smpl_path", None)
+    if current_path is not None and Path(current_path) == preferred_path:
+        return
+    source.gt_smpl_path = preferred_path
+    source.gt_smpl = source.load_sequence(preferred_path)
+
+
 def gender_hint_from_name(path):
     return myfusion_gender_from_name(Path(path), default="neutral")
 
@@ -114,7 +170,19 @@ def source_rgb_name(source, frame_idx):
     rgb_files = getattr(source, "rgb_files", None)
     if rgb_files is not None:
         return Path(rgb_files[frame_idx]).stem
+    rgb_path = source_rgb_file_path(source, frame_idx)
+    if rgb_path is not None:
+        return rgb_path.stem
     return f"{Path(source.path).stem}_frame{frame_idx:08d}"
+
+
+def source_rgb_file_path(source, frame_idx):
+    root = Path(source.path) if Path(source.path).is_dir() else Path(source.path).parent
+    for suffix in (".png", ".jpg", ".jpeg"):
+        path = root / "rgb" / f"{int(frame_idx):08d}{suffix}"
+        if path.exists():
+            return path
+    return None
 
 
 def load_source_rgb_array(source, frame_idx):
@@ -127,6 +195,12 @@ def load_source_rgb_array(source, frame_idx):
             return bgr[:, :, ::-1].astype(np.float32)
         loaded = np.load(path, mmap_mode="r")
         return np.asarray(loaded[loaded.files[0]] if hasattr(loaded, "files") else loaded)
+    rgb_path = source_rgb_file_path(source, frame_idx)
+    if rgb_path is not None:
+        bgr = cv2.imread(str(rgb_path), cv2.IMREAD_COLOR | cv2.IMREAD_IGNORE_ORIENTATION)
+        if bgr is None:
+            raise IOError(f"Fail to read {rgb_path}")
+        return bgr[:, :, ::-1].astype(np.float32)
     if getattr(source, "rgb", None) is None:
         raise FileNotFoundError(f"MyFusion source {source.path} has no RGB data")
     return np.asarray(source.rgb[frame_idx])
@@ -216,32 +290,34 @@ def transform_gt_joints_to_metric(gt_joints, extrinsics, metric_frame="base", ex
     return gt
 
 
-def transform_markers_to_metric(markers, extrinsics, metric_frame="base", extrinsics_direction="camera_to_base"):
-    if not markers or metric_frame == "base":
-        return markers
-    return {
-        name: transform_base_points_to_camera(point[None], extrinsics, extrinsics_direction=extrinsics_direction)[0]
-        for name, point in markers.items()
-    }
+def load_smplx_to_smpl_matrix(device):
+    global SMPLX_TO_SMPL_MATRIX
+    if SMPLX_TO_SMPL_MATRIX is None or SMPLX_TO_SMPL_MATRIX.device != device:
+        matrix_path = Path("assets/SMPLX2SMPL/body_models/smplx2smpl.pkl")
+        matrix = joblib.load(matrix_path)["matrix"]
+        SMPLX_TO_SMPL_MATRIX = torch.from_numpy(matrix).float().to(device)
+    return SMPLX_TO_SMPL_MATRIX
 
 
-def frame_info_for_metric(frame_info, metric_frame="base", extrinsics_direction="camera_to_base"):
-    if metric_frame == "base":
-        return frame_info
-    info = dict(frame_info)
-    info["gt_joints"] = transform_gt_joints_to_metric(
-        frame_info.get("gt_joints"),
-        frame_info.get("extrinsics"),
-        metric_frame=metric_frame,
-        extrinsics_direction=extrinsics_direction,
-    )
-    info["markers"] = transform_markers_to_metric(
-        frame_info.get("markers") or {},
-        frame_info.get("extrinsics"),
-        metric_frame=metric_frame,
-        extrinsics_direction=extrinsics_direction,
-    )
-    return info
+def smplx_vertices_to_smpl_vertices(smplx_vertices):
+    matrix = load_smplx_to_smpl_matrix(smplx_vertices.device)
+    if smplx_vertices.ndim == 2:
+        if smplx_vertices.shape[0] < matrix.shape[1]:
+            raise ValueError(
+                f"SMPL-X vertex count {smplx_vertices.shape[0]} does not match "
+                f"conversion matrix input {matrix.shape[1]}"
+            )
+        smplx_vertices = smplx_vertices[:matrix.shape[1]]
+        return matrix @ smplx_vertices
+    if smplx_vertices.ndim == 3:
+        if smplx_vertices.shape[1] < matrix.shape[1]:
+            raise ValueError(
+                f"SMPL-X vertex count {smplx_vertices.shape[1]} does not match "
+                f"conversion matrix input {matrix.shape[1]}"
+            )
+        smplx_vertices = smplx_vertices[:, :matrix.shape[1]]
+        return torch.matmul(matrix.unsqueeze(0), smplx_vertices)
+    raise ValueError(f"Expected SMPL-X vertices with 2 or 3 dims, got {tuple(smplx_vertices.shape)}")
 
 
 def select_pred_gt_joints(pred, gt_joints, gt_indices):
@@ -283,6 +359,14 @@ def as_numpy(value):
     return np.asarray(value)
 
 
+def as_metric_tensor(value):
+    if value is None:
+        return None
+    if isinstance(value, torch.Tensor):
+        return value.detach().float().cpu()
+    return torch.as_tensor(value, dtype=torch.float32)
+
+
 def rotmat_tensor_to_axis_angle(value):
     if value is None:
         return None
@@ -318,6 +402,24 @@ def camera_rt_to_robot_base(cam_rot, cam_trans, extrinsics, extrinsics_direction
     return base_rot.astype(np.float32), base_trans.astype(np.float32)
 
 
+def rotation_to_robot_base(rot, extrinsics, extrinsics_direction="camera_to_base"):
+    if extrinsics is None:
+        return rot.astype(np.float32)
+    ext_rot = np.asarray(extrinsics, dtype=np.float32)[:3, :3]
+    if extrinsics_direction == "base_to_camera":
+        return (ext_rot.T @ rot).astype(np.float32)
+    return (ext_rot @ rot).astype(np.float32)
+
+
+def serialize_metric_vector(vector):
+    if vector is None:
+        return ""
+    vector = np.asarray(vector, dtype=np.float32).reshape(-1)
+    if vector.size == 0 or not np.isfinite(vector).all():
+        return ""
+    return " ".join(f"{float(v):.9g}" for v in vector)
+
+
 def pad_or_trim_vector(vector, size):
     out = np.zeros(size, dtype=np.float32)
     if vector is None:
@@ -331,102 +433,14 @@ def estimated_smpl_params(outputs, extrinsics=None, extrinsics_direction="camera
     body_param = outputs.get("body_param", {})
     body_global_rot = first_rotmat(body_param.get("global_pose"))
     thetas = pad_or_trim_vector(rotmat_tensor_to_axis_angle(body_param.get("body_pose")), 69)
-
-    cam_rot = np.eye(3, dtype=np.float32)
-    cam_trans = np.zeros(3, dtype=np.float32)
-    pd_cam = as_numpy(outputs.get("pd_cam"))
-    if pd_cam is not None and pd_cam.ndim >= 3 and pd_cam.shape[-2] >= 3 and pd_cam.shape[-1] >= 4:
-        cam_rt = pd_cam.reshape(-1, *pd_cam.shape[-2:])[0]
-        cam_rot = cam_rt[:3, :3].astype(np.float32)
-        cam_trans = cam_rt[:3, 3].astype(np.float32)
-
-    base_cam_rot, trans = camera_rt_to_robot_base(
-        cam_rot,
-        cam_trans,
-        extrinsics,
-        extrinsics_direction=extrinsics_direction,
-    )
-    global_orientation = axis_angle_from_rotmat(base_cam_rot @ body_global_rot)
+    base_rot = rotation_to_robot_base(body_global_rot, extrinsics, extrinsics_direction=extrinsics_direction)
+    global_orientation = axis_angle_from_rotmat(base_rot)
+    trans = np.zeros(3, dtype=np.float32)
     full_pose = np.concatenate([global_orientation, thetas, trans]).astype(np.float32)
     betas = as_numpy(body_param.get("shape"))
     if betas is not None:
         betas = betas.reshape(betas.shape[0], -1)[0].astype(np.float32) if betas.ndim > 1 else betas.reshape(-1).astype(np.float32)
     return full_pose, betas
-
-
-def create_open3d_visualizer():
-    try:
-        import open3d as o3d
-    except ImportError as exc:
-        raise ImportError("Install open3d or run without --open3d_vis.") from exc
-
-    vis = o3d.visualization.Visualizer()
-    vis.create_window(window_name="PEAR visuotactile prediction", width=1280, height=900)
-    return o3d, vis
-
-
-def open3d_marker_spheres(o3d, points, color, radius=0.02):
-    points = np.asarray(points, dtype=np.float32)
-    if points.size == 0:
-        return None
-    points = points.reshape(-1, 3)
-    valid = np.isfinite(points).all(axis=1)
-    points = points[valid]
-    if points.shape[0] == 0:
-        return None
-    merged = o3d.geometry.TriangleMesh()
-    for point in points:
-        sphere = o3d.geometry.TriangleMesh.create_sphere(radius=radius, resolution=12)
-        sphere.translate(point.astype(np.float64))
-        sphere.paint_uniform_color(color)
-        merged += sphere
-    merged.compute_vertex_normals()
-    return merged
-
-
-def update_open3d_visualizer(
-    o3d,
-    vis,
-    meshes_vertices,
-    faces,
-    frame_info,
-    wait_ms=1,
-    reset_view=True,
-):
-    vis.clear_geometries()
-    geometries = [o3d.geometry.TriangleMesh.create_coordinate_frame(size=0.25)]
-
-    for vertices in meshes_vertices:
-        mesh = o3d.geometry.TriangleMesh()
-        mesh.vertices = o3d.utility.Vector3dVector(vertices.astype(np.float64))
-        mesh.triangles = o3d.utility.Vector3iVector(faces.astype(np.int32))
-        mesh.compute_vertex_normals()
-        mesh.paint_uniform_color([0.78, 0.62, 0.48])
-        geometries.append(mesh)
-
-    gt_joints = frame_info.get("gt_joints")
-    if gt_joints is not None:
-        gt = np.asarray(gt_joints, dtype=np.float32)
-        spheres = open3d_marker_spheres(o3d, gt[..., :3], [0.1, 0.85, 0.2], radius=0.018)
-        if spheres is not None:
-            geometries.append(spheres)
-
-    markers = frame_info.get("markers") or {}
-    if markers:
-        marker_points = np.stack(list(markers.values()), axis=0)
-        spheres = open3d_marker_spheres(o3d, marker_points, [1.0, 0.1, 0.05], radius=0.025)
-        if spheres is not None:
-            geometries.append(spheres)
-
-    for geometry in geometries:
-        vis.add_geometry(geometry, reset_bounding_box=False)
-    if reset_view:
-        vis.reset_view_point(True)
-
-    vis.poll_events()
-    vis.update_renderer()
-    if wait_ms > 0:
-        time.sleep(wait_ms / 1000.0)
 
 
 def prepare_metric_joints(
@@ -468,20 +482,29 @@ def prepare_metric_joints(
     return pred_mpjpe[valid], gt[valid]
 
 
-def align_vertices_for_visualization(
-    vertices_base,
-    pred_joints_base,
-    gt_joints,
-    gt_indices,
-    alignment="root",
-    alignment_joint=0,
-):
-    if gt_joints is None or alignment == "none":
-        return vertices_base
-    pred, gt, valid = select_pred_gt_joints(pred_joints_base, gt_joints, gt_indices)
-    if pred is None:
-        return vertices_base
-    return vertices_base + alignment_translation(pred, gt, valid, mode=alignment, root_index=alignment_joint)
+def metric_skip_reason(pd_smplx_dict, frame_info):
+    gt_joints = frame_info.get("gt_joints")
+    if gt_joints is None:
+        return "missing_gt_joints"
+    pred_joints = pd_smplx_dict.get("joints")
+    if pred_joints is None:
+        return "missing_pred_joints"
+    pred_count = int(pred_joints.shape[1]) if hasattr(pred_joints, "shape") and len(pred_joints.shape) >= 2 else 0
+    gt = np.asarray(gt_joints)
+    valid = np.isfinite(gt[..., :3]).all(axis=-1)
+    if gt.shape[-1] > 3:
+        valid &= gt[..., 3] > 0
+    if not np.any(valid):
+        return f"no_valid_gt:{gt.shape}"
+    gt_indices = frame_info.get("gt_indices")
+    if gt_indices is None:
+        return f"missing_gt_indices:pred={pred_count}:gt={gt.shape[0]}"
+    indices = np.asarray(gt_indices, dtype=np.int64).reshape(-1)
+    if indices.size != gt.shape[0]:
+        return f"indices_size_mismatch:idx={indices.size}:gt={gt.shape[0]}"
+    if indices.max(initial=-1) >= pred_count:
+        return f"indices_out_of_range:max={indices.max(initial=-1)}:pred={pred_count}"
+    return f"unknown_after_valid_selection:pred={pred_count}:gt={gt.shape[0]}"
 
 
 def camera_label(cam_idx):
@@ -503,7 +526,8 @@ def sanitize_bbox(bbox, img_width, img_height):
 
     return bbox
 
-def process_bbox(bbox, img_width, img_height, input_img_shape, ratio=1.6):
+
+def process_bbox(bbox, img_width, img_height, input_img_shape, ratio=1.25):
     bbox = sanitize_bbox(bbox, img_width, img_height)
     if bbox is None:
         return bbox
@@ -589,15 +613,37 @@ def generate_patch_image(cvimg, bbox, scale, rot, do_flip, out_shape):
     return img_patch, trans, inv_trans
 
 
-def select_yolo_detections(result, max_detections=1):
+def select_yolo_detections(
+    result,
+    max_detections=1,
+    min_area_frac=0.015,
+    max_area_frac=0.85,
+    min_aspect_ratio=0.15,
+    max_aspect_ratio=8.0,
+):
     boxes = result.boxes
     xyxy = boxes.xyxy.detach().cpu().numpy()
     if xyxy.shape[0] == 0:
         return xyxy
+    conf = boxes.conf.detach().cpu().numpy() if boxes.conf is not None else np.ones(xyxy.shape[0], dtype=np.float32)
     widths = np.maximum(0.0, xyxy[:, 2] - xyxy[:, 0])
     heights = np.maximum(1e-6, xyxy[:, 3] - xyxy[:, 1])
+    areas = widths * heights
+    img_h, img_w = getattr(result, "orig_shape", (0, 0))[:2]
+    image_area = float(max(1, img_h * img_w))
+    area_frac = areas / image_area
     aspect_ratios = widths / heights
-    order = np.lexsort((-widths, -aspect_ratios))
+    keep = (
+        (area_frac >= min_area_frac)
+        & (area_frac <= max_area_frac)
+        & (aspect_ratios >= min_aspect_ratio)
+        & (aspect_ratios <= max_aspect_ratio)
+    )
+    if keep.any():
+        xyxy = xyxy[keep]
+        conf = conf[keep]
+        areas = areas[keep]
+    order = np.lexsort((-areas, -conf))
     xyxy = xyxy[order]
     if max_detections is None or max_detections <= 0 or xyxy.shape[0] <= max_detections:
         return xyxy
@@ -646,6 +692,44 @@ def draw_yolo_bboxes(image, bboxes, scale_factor=1.0, selected_idx=0):
     return image
 
 
+def draw_processed_bboxes(image, bboxes_xywh):
+    if image is None or not bboxes_xywh:
+        return image
+
+    img_h, img_w = image.shape[:2]
+    thickness = max(2, int(round(min(img_h, img_w) / 350)))
+    font_scale = max(0.45, min(img_h, img_w) / 900)
+
+    for bbox_idx, bbox in enumerate(bboxes_xywh):
+        x, y, w, h = np.asarray(bbox, dtype=np.float32).tolist()
+        x1 = int(np.clip(round(x), 0, img_w - 1))
+        y1 = int(np.clip(round(y), 0, img_h - 1))
+        x2 = int(np.clip(round(x + w), 0, img_w - 1))
+        y2 = int(np.clip(round(y + h), 0, img_h - 1))
+        if x2 <= x1 or y2 <= y1:
+            continue
+
+        color = (255, 0, 255)
+        cv2.rectangle(image, (x1, y1), (x2, y2), color, thickness + 1)
+        label = f"processed_{bbox_idx}"
+        (text_w, text_h), baseline = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, font_scale, thickness)
+        label_y1 = min(img_h - text_h - baseline - 4, max(0, y2 + 4))
+        label_y2 = label_y1 + text_h + baseline + 4
+        cv2.rectangle(image, (x1, label_y1), (min(img_w - 1, x1 + text_w + 6), label_y2), color, -1)
+        cv2.putText(
+            image,
+            label,
+            (x1 + 3, label_y2 - baseline - 2),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            font_scale,
+            (0, 0, 0),
+            thickness,
+            cv2.LINE_AA,
+        )
+
+    return image
+
+
 def inference(
     config_name="infer",
     devices="0",
@@ -656,53 +740,39 @@ def inference(
     camera_index=1,
     start=0,
     end=-1,
-    dump_outputs=True,
+    dump_every=1,
     camera_order="metadata",
     extrinsics_direction="camera_to_base",
     apply_pd_cam_to_metrics=False,
     metric_frame="camera",
     mpjpe_alignment="root",
     mpjpe_alignment_joint=0,
-    open3d_vis=False,
-    open3d_wait_ms=1,
-    open3d_reset_view=False,
     max_detections=1,
     activate_occlusion=False,
-    yolo_conf=0.1,
+    yolo_conf=0.4,
     yolo_iou=0.9,
+    yolo_imgsz=1280,
     myfusion_path=DEFAULT_MYFUSION_PATH,
 ):
     if not os.path.exists(output_path):
         os.makedirs(output_path)
-    myfusion_path = setup_myfusion(myfusion_path)
-    print(f"[visuotactile] using MyFusion from {myfusion_path}")
+    setup_myfusion(myfusion_path)
+    dump_enabled = dump_every is not None and dump_every > 0
 
     meta_cfg = ConfigDict(
         model_config_path=os.path.join('configs', f'{config_name}.yaml')
     )
     meta_cfg = add_extra_cfgs(meta_cfg)
     lightning.fabric.seed_everything(10)
-    target_devices = device_parser(devices)
-    init_iter = 1
-    print(str(meta_cfg))
-    print(
-        f"[visuotactile] MPJPE transform: raw SMPL joints -> "
-        f"{metric_frame} frame using {extrinsics_direction} extrinsics"
-        f"{' after pd_cam' if apply_pd_cam_to_metrics else ''}"
-        f", alignment={mpjpe_alignment}"
-    )
-    print(f"[visuotactile] RGB split camera order vs metadata: {camera_order}")
-
     body_renderer = None
     lights = None
-    if dump_outputs:
+    if dump_enabled:
         from models.modules.renderer.body_renderer import Renderer2 as BodyRenderer
         from pytorch3d.renderer import PointLights
 
         body_renderer = BodyRenderer("assets/SMPLX", RENDER_SIZE , focal_length=24.0 ).to(TORCH_DEVICE)
         body_renderer.eval()
         lights=PointLights(device=TORCH_DEVICE, location=[[0.0, -1.0, -10.0]])
-        print(f"Using PyTorch3D renderer at {RENDER_SIZE}x{RENDER_SIZE}.")
 
 
     repo_id = "BestWJH/PEAR_models"  
@@ -720,13 +790,6 @@ def inference(
     ehm = EHM_v2( "assets/FLAME", "assets/SMPLX")
     ehm = ehm.to(TORCH_DEVICE)
     ehm.eval()
-    smplx_faces = ehm.smplx.faces_tensor.detach().cpu().numpy().astype(np.int32)
-
-    o3d = None
-    o3d_vis = None
-    open3d_needs_initial_reset = True
-    if open3d_vis:
-        o3d, o3d_vis = create_open3d_visualizer()
 
     # init detector
     bbox_model = './model_zoo/yolov8x.pt'
@@ -740,8 +803,6 @@ def inference(
     for sequence_dir in sequence_dirs:
         sequence_name = sequence_dir.name if sequence_dir.is_dir() else sequence_dir.stem
         gender_hint = gender_hint_from_name(sequence_dir)
-        if gender_hint != "neutral":
-            print(f"[visuotactile] sequence {sequence_name}: gender hint is {gender_hint}; using current PEAR/EHM model.")
         source = VisuotactileDatasetSource(
             path=sequence_dir,
             cache_root=MYFUSION_CACHE_ROOT,
@@ -751,6 +812,7 @@ def inference(
             use_tactile=False,
             occlusion=False,
         )
+        prefer_input_gt_smpl(source, input_path, sequence_dir)
         n_cams = source_camera_count(source)
         selected_cams = list(range(n_cams)) if camera_index < 0 else [int(camera_index)]
         if any(cam < 0 or cam >= n_cams for cam in selected_cams):
@@ -781,21 +843,21 @@ def inference(
                     "extrinsics": source._retrieve_extrinsics(meta_cam_idx),
                     "gt_joints": source_frame.get("target_joints"),
                     "gt_indices": source_frame.get("target_joint_indices"),
+                    "gt_smpl": getattr(source, "gt_smpl", None),
                     "tactile_point": source_frame.get("tactile_point"),
                     "markers": source_frame.get("patch_markers") or {},
                     "output_dir": frame_output_root / camera_label(cam_idx).replace("_", ""),
                 })
-        print(
-            f"[visuotactile] loaded {len(input_frames)} camera frames so far from MyFusion source {source.path} "
-            f"({len(source)} frames, {n_cams} cameras, camera_order={camera_order})"
-        )
     all_model_time = 0
     processed_images = 0
     processed_model_frames = 0
     successful_frames = 0
     frame_records = []
     source_metric_results = {}
+    metric_skip_reasons = {}
     cached_pre_occlusion_bboxes = {}
+    last_valid_bboxes = {}
+    dumped_video_dirs = set()
     total_frames = len(input_frames)
     pbar = tqdm(input_frames, desc="Processing camera frames", unit="img")
     for idx, frame_info in enumerate(pbar):
@@ -804,13 +866,21 @@ def inference(
         cam_name = camera_label(frame_info["cam_idx"])
         frame_idx = int(frame_info["frame_idx"])
         bbox_cache_key = (seq_name, cam_name)
-        frame_has_occlusion = activate_occlusion and frame_idx >= OCCLUSION_START_FRAME
+        target_bbox_cache_key = (seq_name, cam_name, OCCLUSION_START_FRAME - 1)
+        frame_has_occlusion = activate_occlusion and cam_name == "cam_1" and frame_idx >= OCCLUSION_START_FRAME
+        should_dump_frame = dump_enabled and frame_idx % dump_every == 0
         original_img = source_camera_rgb(
             frame_info["source"],
             frame_idx,
             int(frame_info["cam_idx"]),
             int(frame_info["n_cams"]),
         )
+
+        if original_img is None or original_img.size == 0 or original_img.shape[0] == 0 or original_img.shape[1] == 0:
+            print(f"[visuotactile][warning] Empty image received for {seq_name}/{cam_name} frame {frame_idx}. Skipping...")
+            processed_images += 1
+            continue
+
         if frame_has_occlusion:
             original_img = apply_occlusion_texture(
                 original_img,
@@ -821,7 +891,6 @@ def inference(
             )
         original_img_height, original_img_width = original_img.shape[:2]
 
-        # optionally downscale image for faster detection/ViT input
         if downscale is None or downscale <= 0 or downscale >= 1.0:
             scaled_img = original_img
             scale_factor = 1.0
@@ -831,51 +900,61 @@ def inference(
             sh = max(1, int(original_img_height * scale_factor))
             scaled_img = cv2.resize(original_img, (sw, sh), interpolation=cv2.INTER_LINEAR)
 
-        if frame_has_occlusion:
-            cached_bbox = cached_pre_occlusion_bboxes.get(bbox_cache_key)
+        use_cached_bbox = cam_name == "cam_1" and frame_idx >= OCCLUSION_START_FRAME
+
+        if use_cached_bbox:
+            cached_bbox = cached_pre_occlusion_bboxes.get(target_bbox_cache_key)
+            if cached_bbox is None:
+                cached_bbox = cached_pre_occlusion_bboxes.get(bbox_cache_key)
             if cached_bbox is not None:
                 all_yolo_bbox = cached_bbox.copy()
+                raw_yolo_bbox = all_yolo_bbox
             else:
-                all_yolo_bbox = np.empty((0, 4), dtype=np.float32)
-                print(
-                    f"[visuotactile] missing pre-occlusion bbox for {seq_name}/{cam_name} "
-                    f"at frame {frame_idx}; skipping YOLO on occluded frame"
-                )
+                if detector is None:
+                    detector = YOLO('./model_zoo/yolov8x.pt')
+                yolo_result = detector.predict(
+                    scaled_img,
+                    device='cuda',
+                    classes=0,
+                    conf=yolo_conf,
+                    iou=yolo_iou,
+                    imgsz=yolo_imgsz,
+                    save=False,
+                    verbose=False,
+                )[0]
+                raw_yolo_bbox = yolo_result.boxes.xyxy.detach().cpu().numpy()
+                all_yolo_bbox = select_yolo_detections(yolo_result, max_detections=max_detections)
         else:
             if detector is None:
-                bbox_model = './model_zoo/yolov8x.pt'
-                detector = YOLO(bbox_model)
-            # detection on the (optional) scaled image; boxes are in scaled coordinates
-            yolo_result = detector.predict(scaled_img,  # [h,w,3]  np
-                                    device='cuda', 
-                                    classes=0, 
-                                    conf=yolo_conf,
-                                    iou=yolo_iou,
-                                    save=False, 
-                                    verbose=False)[0]
-            all_yolo_bbox = select_yolo_detections(yolo_result, max_detections=0)
-        yolo_bbox = all_yolo_bbox[:1]
-        if activate_occlusion and frame_idx < OCCLUSION_START_FRAME and len(yolo_bbox) > 0:
-            cached_pre_occlusion_bboxes[bbox_cache_key] = np.asarray(yolo_bbox, dtype=np.float32).copy()
+                detector = YOLO('./model_zoo/yolov8x.pt')
+            
+            yolo_result = detector.predict(
+                scaled_img, device='cuda', classes=0, conf=yolo_conf,
+                iou=yolo_iou, imgsz=yolo_imgsz, save=False, verbose=False
+            )[0]
+            
+            raw_yolo_bbox = yolo_result.boxes.xyxy.detach().cpu().numpy()
+            all_yolo_bbox = select_yolo_detections(yolo_result, max_detections=max_detections)
         
-        vis_img = cv2.cvtColor(original_img.copy(), cv2.COLOR_RGB2BGR) if dump_outputs else None
+        yolo_bbox = all_yolo_bbox[:1]
 
-        if len(all_yolo_bbox) <1:
-            if open3d_vis and o3d_vis is not None:
-                display_frame_info = frame_info_for_metric(
-                    frame_info,
-                    metric_frame=metric_frame,
-                    extrinsics_direction=extrinsics_direction,
-                )
-                update_open3d_visualizer(
-                    o3d,
-                    o3d_vis,
-                    [],
-                    smplx_faces,
-                    display_frame_info,
-                    wait_ms=open3d_wait_ms,
-                    reset_view=False,
-                )
+        if len(yolo_bbox) == 0 and cam_name == "cam_2":
+            cached_bbox = last_valid_bboxes.get(bbox_cache_key)
+            if cached_bbox is not None:
+                all_yolo_bbox = cached_bbox.copy()
+                raw_yolo_bbox = all_yolo_bbox
+                yolo_bbox = all_yolo_bbox[:1]
+        elif len(yolo_bbox) > 0:
+            last_valid_bboxes[bbox_cache_key] = np.asarray(yolo_bbox, dtype=np.float32).copy()
+
+        if cam_name == "cam_1" and frame_idx < OCCLUSION_START_FRAME and len(yolo_bbox) > 0:
+            cached_pre_occlusion_bboxes[bbox_cache_key] = np.asarray(yolo_bbox, dtype=np.float32).copy()
+            if frame_idx == OCCLUSION_START_FRAME - 1:
+                cached_pre_occlusion_bboxes[target_bbox_cache_key] = np.asarray(yolo_bbox, dtype=np.float32).copy()
+
+        vis_img = cv2.cvtColor(original_img.copy(), cv2.COLOR_RGB2BGR) if should_dump_frame else None
+
+        if len(yolo_bbox) == 0:
             processed_images += 1
             mean_model_fps = processed_model_frames / all_model_time if all_model_time > 0 else 0.0
             frame_records.append({
@@ -906,13 +985,14 @@ def inference(
                 # mpjpe="n/a",
                 # status="no person",
             )
+            print(f"[visuotactile][warning] no person detected by YOLO for {seq_name}/{cam_name} frame {frame_idx}")
             continue
         num_bbox = len(yolo_bbox)
 
         # loop all detected bboxes
         frame_metric_rows = []
         frame_model_time = 0.0
-        frame_meshes = []
+        processed_bboxes = []
         for bbox_id in range(num_bbox):
             yolo_bbox_xywh = np.zeros((4))
             yolo_bbox_xywh[0] = yolo_bbox[bbox_id][0]
@@ -930,17 +1010,15 @@ def inference(
                                 img_width=original_img_width, 
                                 img_height=original_img_height, 
                                 input_img_shape=[256,256], 
-                                ratio=1.6)          
+                                ratio=1.25)          
             if bbox is None:
                 continue
-            # determine rotation for horizontal subjects: rotate upright
+            processed_bboxes.append(bbox.copy())
             rot = 0.0
-            if bbox[2] > bbox[3] * 1.2:
-                rot = 90.0
                   
             img_patch, trans, inv_trans = generate_patch_image(cvimg=original_img, 
                                                 bbox=bbox, 
-                                                scale=1.15, 
+                                                scale=1.0, 
                                                 rot=rot, 
                                                 do_flip=False, 
                                                 out_shape=[256,256])
@@ -985,59 +1063,81 @@ def inference(
                     alignment=mpjpe_alignment,
                     alignment_joint=mpjpe_alignment_joint,
                 )
-                if pred_metric is not None:
-                    frame_metric_rows.append(
-                        make_visuotactile_metrics_row(
-                            frame_idx=frame_idx,
-                            timestamp_ns=frame_info.get("timestamp_ns", frame_idx),
-                            pred_joints=pred_metric,
-                            gt_joints=gt_metric,
-                            tactile=frame_info.get("tactile_point"),
-                            full_pose=full_pose,
-                            betas=betas,
+                if pred_metric is None:
+                    reason = metric_skip_reason(pd_smplx_dict, frame_info)
+                    metric_skip_reasons[reason] = metric_skip_reasons.get(reason, 0) + 1
+                metric_row = make_visuotactile_metrics_row(
+                    frame_idx=frame_idx,
+                    timestamp_ns=frame_info.get("timestamp_ns", frame_idx),
+                    pred_joints=as_metric_tensor(pred_metric),
+                    gt_joints=as_metric_tensor(gt_metric),
+                    tactile=frame_info.get("tactile_point"),
+                    full_pose=full_pose,
+                    betas=betas,
+                )
+                if compute_visuotactile_surface_metrics is not None:
+                    estimated_vertices_base = None
+                    surface_alignment_base = None
+                    vertices_tensor = pd_smplx_dict.get("vertices")
+                    if vertices_tensor is not None:
+                        estimated_vertices_smpl = smplx_vertices_to_smpl_vertices(
+                            vertices_tensor[0].detach().float()
                         )
-                    )
+                        estimated_vertices = estimated_vertices_smpl.cpu().numpy().astype(np.float32)
+                        estimated_vertices_base = transform_pred_points_to_metric(
+                            estimated_vertices,
+                            outputs,
+                            frame_info["extrinsics"],
+                            metric_frame="base",
+                            extrinsics_direction=extrinsics_direction,
+                            apply_pd_cam=False,
+                        )
+                        pred_joints_tensor = pd_smplx_dict.get("joints")
+                        if pred_joints_tensor is not None and frame_info.get("gt_joints") is not None:
+                            pred_joints_base = transform_pred_points_to_metric(
+                                pred_joints_tensor[0].detach().float().cpu().numpy().astype(np.float32),
+                                outputs,
+                                frame_info["extrinsics"],
+                                metric_frame="base",
+                                extrinsics_direction=extrinsics_direction,
+                                apply_pd_cam=False,
+                            )
+                            pred_sel, gt_sel, valid_sel = select_pred_gt_joints(
+                                pred_joints_base,
+                                frame_info.get("gt_joints"),
+                                frame_info.get("gt_indices"),
+                            )
+                            if pred_sel is not None:
+                                surface_alignment_base = alignment_translation(
+                                    pred_sel,
+                                    gt_sel,
+                                    valid_sel,
+                                    mode=mpjpe_alignment,
+                                    root_index=mpjpe_alignment_joint,
+                                )
+                                estimated_vertices_base = estimated_vertices_base + surface_alignment_base
+                                metric_row["trans"] = serialize_metric_vector(surface_alignment_base)
+                    else:
+                        print(
+                            f"[visuotactile][warning] no predicted SMPL vertices for "
+                            f"{seq_name}/{cam_name} frame {frame_idx}"
+                        )
 
-                if open3d_vis:
-                    vertices = pd_smplx_dict['vertices'][0].detach().float().cpu().numpy().astype(np.float32)
-                    pred_joints = pd_smplx_dict['joints'][0].detach().float().cpu().numpy().astype(np.float32)
-                    vertices = transform_pred_points_to_metric(
-                        vertices,
-                        outputs,
-                        frame_info["extrinsics"],
-                        metric_frame=metric_frame,
-                        extrinsics_direction=extrinsics_direction,
-                        apply_pd_cam=apply_pd_cam_to_metrics,
+                    surface_metrics = compute_visuotactile_surface_metrics(
+                        frame_idx=frame_idx,
+                        gt_smpl=frame_info.get("gt_smpl"),
+                        estimated_smpl_vertices=estimated_vertices_base,
+                        fused_vertices=estimated_vertices_base,
+                        patch_markers=frame_info.get("markers") or {},
                     )
-                    pred_joints = transform_pred_points_to_metric(
-                        pred_joints,
-                        outputs,
-                        frame_info["extrinsics"],
-                        metric_frame=metric_frame,
-                        extrinsics_direction=extrinsics_direction,
-                        apply_pd_cam=apply_pd_cam_to_metrics,
-                    )
-                    display_frame_info = frame_info_for_metric(
-                        frame_info,
-                        metric_frame=metric_frame,
-                        extrinsics_direction=extrinsics_direction,
-                    )
-                    vertices = align_vertices_for_visualization(
-                        vertices,
-                        pred_joints,
-                        display_frame_info["gt_joints"],
-                        display_frame_info["gt_indices"],
-                        alignment=mpjpe_alignment,
-                        alignment_joint=mpjpe_alignment_joint,
-                    )
-                    frame_meshes.append(vertices)
- 
+                    metric_row.update(surface_metrics)
+                frame_metric_rows.append(metric_row)
 
-                if dump_outputs and body_renderer is not None and lights is not None:
+                if should_dump_frame and body_renderer is not None and lights is not None:
                     pd_camera = GS_Camera(**build_cameras_kwargs(1,24), R = outputs['pd_cam'][0:0+1,:3,:3], T = outputs['pd_cam'][0:0+1,:3,3])
                     pd_mesh_rgba = body_renderer.render_mesh(pd_smplx_dict['vertices'][None, 0,...], pd_camera, lights=lights )
 
-            if dump_outputs and vis_img is not None:
+            if should_dump_frame and vis_img is not None:
                 pd_mesh_rgba = (pd_mesh_rgba.detach().cpu().numpy()).clip(0, 255).astype(np.uint8)[0].transpose(1,2,0)
 
                 pd_mesh_img = cv2.cvtColor(pd_mesh_rgba[:, :, :3].copy(), cv2.COLOR_RGB2BGR)
@@ -1072,31 +1172,17 @@ def inference(
                     + (1.0 - overlay_alpha) * vis_img[mask].astype(np.float32)
                 ).astype(np.uint8)
 
-        if open3d_vis and o3d_vis is not None:
-            display_frame_info = frame_info_for_metric(
-                frame_info,
-                metric_frame=metric_frame,
-                extrinsics_direction=extrinsics_direction,
-            )
-            update_open3d_visualizer(
-                o3d,
-                o3d_vis,
-                frame_meshes,
-                smplx_faces,
-                display_frame_info,
-                wait_ms=open3d_wait_ms,
-                reset_view=open3d_needs_initial_reset and len(frame_meshes) > 0,
-            )
-            if frame_meshes:
-                open3d_needs_initial_reset = False
-
         finite_metric_rows = [
             row for row in frame_metric_rows
             if np.isfinite(float(row.get("mpjpe_mm", float("nan"))))
         ]
         frame_metric_row = min(finite_metric_rows, key=lambda row: float(row["mpjpe_mm"])) if finite_metric_rows else None
-        frame_mpjpe = None if frame_metric_row is None else float(frame_metric_row["mpjpe_mm"])
-        frame_pa_mpjpe = None if frame_metric_row is None else float(frame_metric_row["pa_mpjpe_mm"])
+        if frame_metric_row is None and frame_metric_rows:
+            frame_metric_row = frame_metric_rows[0]
+        frame_mpjpe_value = None if frame_metric_row is None else float(frame_metric_row["mpjpe_mm"])
+        frame_pa_mpjpe_value = None if frame_metric_row is None else float(frame_metric_row["pa_mpjpe_mm"])
+        frame_mpjpe = frame_mpjpe_value if frame_mpjpe_value is not None and np.isfinite(frame_mpjpe_value) else None
+        frame_pa_mpjpe = frame_pa_mpjpe_value if frame_pa_mpjpe_value is not None and np.isfinite(frame_pa_mpjpe_value) else None
         if frame_metric_row is not None:
             result_key = (seq_name, cam_name)
             result = source_metric_results.setdefault(
@@ -1104,7 +1190,7 @@ def inference(
                 {"sequence": f"{seq_name}_{cam_name}", "rows": []},
             )
             result["rows"].append(frame_metric_row)
-        if dump_outputs and vis_img is not None:
+        if should_dump_frame and vis_img is not None:
             vis_img = np.clip(vis_img, 0, 255).astype(np.uint8)
             if frame_has_occlusion:
                 vis_img = apply_occlusion_texture(
@@ -1114,10 +1200,18 @@ def inference(
                     int(frame_info["cam_idx"]),
                     image_order="BGR",
                 )
-            draw_yolo_bboxes(vis_img, all_yolo_bbox, scale_factor=scale_factor, selected_idx=0)
+            debug_bboxes = raw_yolo_bbox if frame_idx % 5 == 0 else all_yolo_bbox
+            draw_yolo_bboxes(
+                vis_img,
+                debug_bboxes,
+                scale_factor=scale_factor,
+                selected_idx=-1 if frame_idx % 5 == 0 else 0,
+            )
+            draw_processed_bboxes(vis_img, processed_bboxes)
             frame_output_dir = Path(frame_info.get("output_dir", output_path))
             frame_output_dir.mkdir(parents=True, exist_ok=True)
             cv2.imwrite(str(frame_output_dir / f"mesh_{img_name}.jpg"), vis_img)
+            dumped_video_dirs.add(str(frame_output_dir))
         frame_model_fps = 1.0 / frame_model_time if frame_model_time > 0 else 0.0
         all_model_time += frame_model_time
         processed_images += 1
@@ -1136,7 +1230,7 @@ def inference(
             "pa_mpjpe_mm": f"{frame_pa_mpjpe:.4f}" if frame_pa_mpjpe is not None else "",
             "model_time_s": f"{frame_model_time:.6f}",
             "model_fps": f"{frame_model_fps:.4f}",
-            "status": "saved" if dump_outputs else "processed",
+            "status": "saved" if should_dump_frame else "processed",
         })
         pbar.set_description(
             f"Processing camera frames success={successful_frames}/{total_frames} frame={processed_images}/{total_frames}"
@@ -1148,11 +1242,10 @@ def inference(
             file=img_name,
             cam=cam_name,
             boxes=num_bbox,
-            meshes=len(frame_meshes),
             model_fps=f"{mean_model_fps:.2f}",
             mpjpe=f"{frame_mpjpe:.1f}mm" if frame_mpjpe is not None else "n/a",
             pa=f"{frame_pa_mpjpe:.1f}mm" if frame_pa_mpjpe is not None else "n/a",
-            status="saved" if dump_outputs else "processed",
+            status="saved" if should_dump_frame else "processed",
         )
 
     # print mean inference FPS (detection+model+render per image)
@@ -1161,32 +1254,32 @@ def inference(
     else:
         mean_fps = 0.0
     print(f"Processed {processed_images} frames. Model-only inference FPS: {mean_fps:.2f}")
+    if metric_skip_reasons:
+        print("[visuotactile] frames without calculable MPJPE:")
+        for reason, count in sorted(metric_skip_reasons.items(), key=lambda item: item[1], reverse=True):
+            print(f"  {reason}: {count}")
     for result in source_metric_results.values():
         write_visuotactile_metrics_csv(result, output_path)
 
-    if dump_outputs:
-        video_dirs = sorted({str(row.get("output_dir", output_path)) for row in input_frames})
-        for video_dir in video_dirs:
+    if dump_enabled:
+        for video_dir in sorted(dumped_video_dirs):
             images_to_video(
                 video_dir,
                 os.path.join(video_dir, "video.mp4"),
                 fps=30
             )
-    if o3d_vis is not None:
-        o3d_vis.destroy_window()
-        
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument('--input_path', default='../Nardi/m1_2026-04-28-13-05-40_0', type=str)
     parser.add_argument('--output_path', default='outputs', type=str)
     parser.add_argument('--end', default=-1, type=int, help='Exclusive dataset RGB frame index to process. Use -1 for all remaining frames.')
-    parser.add_argument('--open3d_vis', action='store_true', help='Show predicted SMPL-X meshes, target joints, and markers in Open3D frame by frame.')
     parser.add_argument('--camera-index', dest='camera_index', default=1, type=int, help='Camera view to process after horizontal RGB split.')
     parser.add_argument('--activate-occlusion', action='store_true', help='Apply per-frame occlusion textures from the occlusion_patches folder.')
-    parser.add_argument('--no-dump-outputs', action='store_true', help='Do not save overlay images or videos; metrics CSV are still saved.')
-    parser.add_argument('--yolo-conf', dest='yolo_conf', default=0.4, type=float, help='YOLO person detection confidence threshold.')
+    parser.add_argument('--dump-every', dest='dump_every', default=1, type=int, help='Save overlay images every N dataset frames. Use -1 to disable image/video dumps.')
+    parser.add_argument('--yolo-conf', dest='yolo_conf', default=0.2, type=float, help='YOLO person detection confidence threshold.')
     parser.add_argument('--yolo-iou', dest='yolo_iou', default=0.9, type=float, help='YOLO NMS IoU threshold. Higher values keep more overlapping boxes.')
+    parser.add_argument('--yolo-imgsz', dest='yolo_imgsz', default=1280, type=int, help='YOLO inference image size. Higher values can improve bbox precision but are slower.')
     parser.add_argument(
         '--myfusion-path',
         default=str(DEFAULT_MYFUSION_PATH),
@@ -1194,18 +1287,17 @@ if __name__ == "__main__":
         help='Path to the MyFusion package folder or to the workspace folder that contains it.',
     )
     args = parser.parse_args()
-    print("Command Line Args: {}".format(args))
     torch.set_float32_matmul_precision('high')
     inference(
         input_path=args.input_path,
         output_path=args.output_path,
         camera_index=args.camera_index,
         end=args.end,
-        dump_outputs=not args.no_dump_outputs,
-        open3d_vis=args.open3d_vis,
+        dump_every=args.dump_every,
         activate_occlusion=args.activate_occlusion,
         yolo_conf=args.yolo_conf,
         yolo_iou=args.yolo_iou,
+        yolo_imgsz=args.yolo_imgsz,
         myfusion_path=args.myfusion_path,
         max_detections=2
     )
